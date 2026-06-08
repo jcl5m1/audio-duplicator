@@ -1,0 +1,15 @@
+# Build output (reproduced by compiling AudioDuplicator.cs — see README)
+AudioDuplicator.exe
+
+# Downloaded dependency (restore with setup.ps1)
+NAudio.dll
+
+# Machine-specific runtime state (recreated by the app on first run)
+settings.json
+
+# Runtime diagnostics log
+debug.log
+
+# setup.ps1 temporary artifacts
+naudio_temp.zip
+naudio_temp_extract/
