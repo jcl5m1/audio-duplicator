@@ -31,20 +31,32 @@ namespace AudioDuplicator
         private static string _selectedInputId = "default";
         private static string _selectedOut1Id = "";
         private static string _selectedOut2Id = "";
-        private static bool _isRunning = false;
+        private static volatile bool _isRunning = false;   // capture pipeline is currently up
+        private static volatile bool _wantRunning = false; // user wants duplication on; drives auto-reconnect
         private static readonly string SettingsFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.json");
+
+        // One playback path. The Provider lives as long as the capture; Play/Resampler are
+        // recreated on each reconnect so one output can recover without touching the other.
+        private sealed class OutputSlot
+        {
+            public readonly string Name;
+            public OutputSlot(string name) { Name = name; }
+
+            public BufferedWaveProvider Provider;
+            public WasapiOut Play;
+            public MediaFoundationResampler Resampler;
+            public volatile bool Live;    // playing; capture feeds Provider only while true
+            public volatile bool Faulted; // playback thread stopped with an exception
+            public long PruneCount;       // times the buffer was force-cleared
+            public string LastError;      // last reported open failure, so retries log only on change
+        }
 
         // Audio Objects
         private static WasapiCapture _capture;
-        private static WasapiOut _play1;
-        private static WasapiOut _play2;
-        private static BufferedWaveProvider _provider1;
-        private static BufferedWaveProvider _provider2;
-        private static MediaFoundationResampler _resampler1;
-        private static MediaFoundationResampler _resampler2;
-        private static MMDevice _inputDevice;
-        private static MMDevice _outDevice1;
-        private static MMDevice _outDevice2;
+        private static volatile bool _captureFaulted = false;
+        private static readonly OutputSlot _out1 = new OutputSlot("Output 1");
+        private static readonly OutputSlot _out2 = new OutputSlot("Output 2");
+        private const int ReconnectPollMillis = 2000;
 
         private static NotifyIcon _sysTrayIcon;
         private static ContextMenu _sysTrayMenu;
@@ -55,8 +67,6 @@ namespace AudioDuplicator
         private static readonly string LogFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug.log");
         private static long _captureBytesSinceTick = 0;   // bytes delivered by capture since last stats tick
         private static int _captureCallbacksSinceTick = 0; // number of DataAvailable callbacks since last stats tick
-        private static long _pruneCount1 = 0;              // times provider 1 buffer was force-cleared
-        private static long _pruneCount2 = 0;              // times provider 2 buffer was force-cleared
 
         private static void Log(string msg)
         {
@@ -120,6 +130,9 @@ namespace AudioDuplicator
                 }
             }
 
+            // Watch for lost devices and reopen them when they return
+            new Thread(ReconnectLoop) { IsBackground = true, Name = "Reconnect" }.Start();
+
             // Run Windows Message Loop (keeps app alive in tray) or wait on event in headless mode
             if (_sysTrayIcon != null)
             {
@@ -161,8 +174,8 @@ namespace AudioDuplicator
             // checkmarks reflect the current state.
             _sysTrayMenu.Popup += (s, e) =>
             {
-                toggleItem.Text = _isRunning ? "Stop Duplication" : "Start Duplication";
-                toggleItem.Checked = _isRunning;
+                toggleItem.Text = _wantRunning ? "Stop Duplication" : "Start Duplication";
+                toggleItem.Checked = _wantRunning;
 
                 PopulateDeviceMenu(inputMenu, "Input Device", 0, _selectedInputId);
                 PopulateDeviceMenu(out1Menu, "Output 1", 1, _selectedOut1Id);
@@ -250,7 +263,7 @@ namespace AudioDuplicator
             // Apply immediately by restarting the pipeline if it is already running.
             lock (_audioLock)
             {
-                if (_isRunning)
+                if (_wantRunning)
                 {
                     StopDuplicationInternal();
                     StartDuplicationInternal();
@@ -262,8 +275,9 @@ namespace AudioDuplicator
         {
             lock (_audioLock)
             {
-                if (_isRunning)
+                if (_wantRunning)
                 {
+                    _wantRunning = false;
                     StopDuplicationInternal();
                 }
                 else
@@ -298,16 +312,18 @@ namespace AudioDuplicator
                     int avgBps = (_capture != null && _capture.WaveFormat != null) ? _capture.WaveFormat.AverageBytesPerSecond : 0;
                     if (avgBps > 0) capturedMs = (double)capBytes / avgBps * 1000.0;
 
-                    double buf1 = _provider1 != null ? _provider1.BufferedDuration.TotalMilliseconds : -1;
-                    double buf2 = _provider2 != null ? _provider2.BufferedDuration.TotalMilliseconds : -1;
+                    var provider1 = _out1.Provider;
+                    var provider2 = _out2.Provider;
+                    double buf1 = provider1 != null ? provider1.BufferedDuration.TotalMilliseconds : -1;
+                    double buf2 = provider2 != null ? provider2.BufferedDuration.TotalMilliseconds : -1;
 
                     Log(string.Format(CultureInfo.InvariantCulture,
                         "STATS captured={0:F0}ms/s ({1} bytes, {2} cb) | buf1={3:F0}ms buf2={4:F0}ms | prunes1={5} prunes2={6} | play1={7} play2={8}",
                         capturedMs, capBytes, callbacks, buf1, buf2,
-                        Interlocked.Read(ref _pruneCount1),
-                        Interlocked.Read(ref _pruneCount2),
-                        _play1 != null ? _play1.PlaybackState.ToString() : "null",
-                        _play2 != null ? _play2.PlaybackState.ToString() : "null"));
+                        Interlocked.Read(ref _out1.PruneCount),
+                        Interlocked.Read(ref _out2.PruneCount),
+                        DescribeOutputState(_out1),
+                        DescribeOutputState(_out2)));
                 }
                 catch (Exception ex)
                 {
@@ -316,24 +332,35 @@ namespace AudioDuplicator
             }
         }
 
+        private static string DescribeOutputState(OutputSlot slot)
+        {
+            var play = slot.Play;
+            if (!slot.Live || play == null) return "disconnected";
+            return play.PlaybackState.ToString();
+        }
+
         #endregion
 
         #region Audio Duplication Core
 
-        private static void StartDuplicationInternal()
+        // Caller must hold _audioLock. A missing output does not stop the pipeline: the other
+        // output plays and ReconnectLoop opens the missing one when it appears.
+        private static void StartDuplicationInternal(bool notifyOnFailure = true)
         {
+            _wantRunning = true;
             try
             {
                 var enumerator = new MMDeviceEnumerator();
 
-                // 1. Resolve Devices
+                // 1. Resolve Input
+                MMDevice inputDevice;
                 if (_selectedInputId == "default" || string.IsNullOrEmpty(_selectedInputId))
                 {
-                    _inputDevice = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+                    inputDevice = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
                 }
                 else
                 {
-                    _inputDevice = enumerator.GetDevice(_selectedInputId);
+                    inputDevice = enumerator.GetDevice(_selectedInputId);
                 }
 
                 if (string.IsNullOrEmpty(_selectedOut1Id) || string.IsNullOrEmpty(_selectedOut2Id))
@@ -341,30 +368,27 @@ namespace AudioDuplicator
                     throw new Exception("Output devices are not fully configured.");
                 }
 
-                _outDevice1 = enumerator.GetDevice(_selectedOut1Id);
-                _outDevice2 = enumerator.GetDevice(_selectedOut2Id);
-
                 Log("=== Starting duplication ===");
-                Log("Input device : " + _inputDevice.FriendlyName);
-                Log("Output 1     : " + _outDevice1.FriendlyName);
-                Log("Output 2     : " + _outDevice2.FriendlyName);
+                Log("Input device : " + inputDevice.FriendlyName);
 
                 // 2. Initialize Capture with 40ms buffer
-                _capture = new WasapiLoopbackCaptureEx(_inputDevice, 40);
-                Log("Capture format: " + DescribeFormat(_capture.WaveFormat) + " (avgBytes/s=" + _capture.WaveFormat.AverageBytesPerSecond + ")");
+                var capture = new WasapiLoopbackCaptureEx(inputDevice, 40);
+                _capture = capture;
+                _captureFaulted = false;
+                Log("Capture format: " + DescribeFormat(capture.WaveFormat) + " (avgBytes/s=" + capture.WaveFormat.AverageBytesPerSecond + ")");
 
                 // Reset diagnostic counters for this run
                 _captureBytesSinceTick = 0;
                 _captureCallbacksSinceTick = 0;
-                _pruneCount1 = 0;
-                _pruneCount2 = 0;
+                _out1.PruneCount = 0;
+                _out2.PruneCount = 0;
 
                 // 3. Initialize Buffers with Loopback Format and bound to 2s buffer duration for safety headroom
-                _provider1 = new BufferedWaveProvider(_capture.WaveFormat) { DiscardOnBufferOverflow = true, ReadFully = true, BufferDuration = TimeSpan.FromSeconds(2) };
-                _provider2 = new BufferedWaveProvider(_capture.WaveFormat) { DiscardOnBufferOverflow = true, ReadFully = true, BufferDuration = TimeSpan.FromSeconds(2) };
+                _out1.Provider = new BufferedWaveProvider(capture.WaveFormat) { DiscardOnBufferOverflow = true, ReadFully = true, BufferDuration = TimeSpan.FromSeconds(2) };
+                _out2.Provider = new BufferedWaveProvider(capture.WaveFormat) { DiscardOnBufferOverflow = true, ReadFully = true, BufferDuration = TimeSpan.FromSeconds(2) };
 
-                // 4. Hook capture event
-                _capture.DataAvailable += (s, e) =>
+                // 4. Hook capture events
+                capture.DataAvailable += (s, e) =>
                 {
                     // Track capture throughput regardless of byte count so we can detect a starved/silent source
                     Interlocked.Add(ref _captureBytesSinceTick, e.BytesRecorded);
@@ -372,59 +396,21 @@ namespace AudioDuplicator
 
                     if (e.BytesRecorded > 0)
                     {
-                        _provider1.AddSamples(e.Buffer, 0, e.BytesRecorded);
-                        _provider2.AddSamples(e.Buffer, 0, e.BytesRecorded);
-
-                        // Keep buffer size under control to minimize latency and prevent stutter
-                        PruneBuffer("Provider 1 (Output 1)", _provider1, 300, ref _pruneCount1);
-                        PruneBuffer("Provider 2 (Output 2)", _provider2, 300, ref _pruneCount2);
+                        FeedOutput(_out1, e.Buffer, e.BytesRecorded);
+                        FeedOutput(_out2, e.Buffer, e.BytesRecorded);
                     }
                 };
-
-                // Surface playback stopped events (driver glitches / device removal manifest here)
-                EventHandler<StoppedEventArgs> onStopped = (s, e) =>
+                capture.RecordingStopped += (s, e) =>
                 {
-                    if (e.Exception != null) Log("PLAYBACK STOPPED with exception: " + e.Exception.Message);
+                    if (e.Exception == null) return;
+                    Log("CAPTURE STOPPED with exception: " + e.Exception.Message);
+                    if (_capture == capture) _captureFaulted = true;
                 };
 
-                // 5. Initialize Output 1 with 50ms target latency in timer-driven mode
-                _play1 = new WasapiOut(_outDevice1, AudioClientShareMode.Shared, false, 50);
-                _play1.PlaybackStopped += onStopped;
-                var mixFormat1 = _outDevice1.AudioClient.MixFormat;
-                IWaveProvider finalProv1 = _provider1;
-                if (RequiresResampling(_outDevice1, _capture.WaveFormat))
-                {
-                    _resampler1 = new MediaFoundationResampler(_provider1, mixFormat1) { ResamplerQuality = 60 };
-                    finalProv1 = _resampler1;
-                    Log("Output 1 mix format: " + DescribeFormat(mixFormat1) + " -> RESAMPLING enabled");
-                }
-                else
-                {
-                    Log("Output 1 mix format: " + DescribeFormat(mixFormat1) + " -> passthrough (no resample, device accepts capture format)");
-                }
-                _play1.Init(finalProv1);
-
-                // 6. Initialize Output 2 with 50ms target latency in timer-driven mode
-                _play2 = new WasapiOut(_outDevice2, AudioClientShareMode.Shared, false, 50);
-                _play2.PlaybackStopped += onStopped;
-                var mixFormat2 = _outDevice2.AudioClient.MixFormat;
-                IWaveProvider finalProv2 = _provider2;
-                if (RequiresResampling(_outDevice2, _capture.WaveFormat))
-                {
-                    _resampler2 = new MediaFoundationResampler(_provider2, mixFormat2) { ResamplerQuality = 60 };
-                    finalProv2 = _resampler2;
-                    Log("Output 2 mix format: " + DescribeFormat(mixFormat2) + " -> RESAMPLING enabled");
-                }
-                else
-                {
-                    Log("Output 2 mix format: " + DescribeFormat(mixFormat2) + " -> passthrough (no resample, device accepts capture format)");
-                }
-                _play2.Init(finalProv2);
-
-                // 7. Start Playback & Capture
-                _play1.Play();
-                _play2.Play();
-                _capture.StartRecording();
+                // 5. Start Playback & Capture
+                StartOutput(_out1, _selectedOut1Id);
+                StartOutput(_out2, _selectedOut2Id);
+                capture.StartRecording();
 
                 _isRunning = true;
                 Log("Duplication started successfully.");
@@ -433,10 +419,169 @@ namespace AudioDuplicator
             {
                 StopDuplicationInternal();
                 Log("Failed to start audio duplication: " + ex);
-                if (_sysTrayIcon != null)
+                if (notifyOnFailure && _sysTrayIcon != null)
                 {
                     _sysTrayIcon.ShowBalloonTip(3000, "Audio Duplicator Error", "Failed to start audio duplication: " + ex.Message, ToolTipIcon.Error);
                 }
+            }
+        }
+
+        private static void FeedOutput(OutputSlot slot, byte[] buffer, int count)
+        {
+            var provider = slot.Provider;
+            if (provider == null || !slot.Live) return;
+
+            provider.AddSamples(buffer, 0, count);
+
+            // Keep buffer size under control to minimize latency and prevent stutter
+            PruneBuffer(slot.Name, provider, 300, ref slot.PruneCount);
+        }
+
+        // Caller must hold _audioLock. Opens one output in shared mode with 50ms target latency in
+        // timer-driven mode. Returns false (and leaves the slot closed) if the device cannot open.
+        private static bool StartOutput(OutputSlot slot, string deviceId)
+        {
+            try
+            {
+                var device = new MMDeviceEnumerator().GetDevice(deviceId);
+                var format = slot.Provider.WaveFormat;
+
+                var player = new WasapiOut(device, AudioClientShareMode.Shared, false, 50);
+                slot.Play = player;
+                slot.Faulted = false;
+
+                // Device removal manifests here. The check ignores late events from a closed player.
+                player.PlaybackStopped += (s, e) =>
+                {
+                    if (e.Exception == null) return;
+                    Log(slot.Name + " PLAYBACK STOPPED with exception: " + e.Exception.Message);
+                    if (slot.Play == player) slot.Faulted = true;
+                };
+
+                var mixFormat = device.AudioClient.MixFormat;
+                IWaveProvider finalProvider = slot.Provider;
+                string conversion = "passthrough (no resample, device accepts capture format)";
+                if (RequiresResampling(device, format))
+                {
+                    slot.Resampler = new MediaFoundationResampler(slot.Provider, mixFormat) { ResamplerQuality = 60 };
+                    finalProvider = slot.Resampler;
+                    conversion = "RESAMPLING enabled";
+                }
+                player.Init(finalProvider);
+
+                slot.Provider.ClearBuffer();
+                slot.Live = true;
+                player.Play();
+
+                slot.LastError = null;
+                Log(slot.Name + " opened: " + device.FriendlyName + ", mix format " + DescribeFormat(mixFormat) + " -> " + conversion);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                StopOutput(slot);
+                if (slot.LastError != ex.Message)
+                {
+                    slot.LastError = ex.Message;
+                    Log(slot.Name + " could not open, will retry: " + ex.Message);
+                }
+                return false;
+            }
+        }
+
+        // Caller must hold _audioLock. Keeps the Provider so the slot can reopen on the same capture.
+        private static void StopOutput(OutputSlot slot)
+        {
+            slot.Live = false;
+            var player = slot.Play;
+            var resampler = slot.Resampler;
+            slot.Play = null;
+            slot.Resampler = null;
+            slot.Faulted = false;
+
+            try { if (player != null) player.Stop(); } catch { }
+            try { if (player != null) player.Dispose(); } catch { }
+            try { if (resampler != null) resampler.Dispose(); } catch { }
+        }
+
+        private static void ReconnectLoop()
+        {
+            var enumerator = new MMDeviceEnumerator();
+            while (true)
+            {
+                Thread.Sleep(ReconnectPollMillis);
+                try
+                {
+                    lock (_audioLock)
+                    {
+                        if (_wantRunning) CheckDevices(enumerator);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log("Reconnect check exception: " + ex.Message);
+                }
+            }
+        }
+
+        // Caller must hold _audioLock.
+        private static void CheckDevices(MMDeviceEnumerator enumerator)
+        {
+            // The capture owns the buffers, so losing it restarts the whole pipeline.
+            bool inputAvailable = IsInputAvailable(enumerator);
+            if (_capture != null && !inputAvailable) _captureFaulted = true;
+            if (_capture == null || _captureFaulted)
+            {
+                if (!inputAvailable) return;
+                Log("Input device available. Restarting duplication.");
+                StopDuplicationInternal();
+                StartDuplicationInternal(false);
+                return;
+            }
+
+            CheckOutput(enumerator, _out1, _selectedOut1Id);
+            CheckOutput(enumerator, _out2, _selectedOut2Id);
+        }
+
+        private static void CheckOutput(MMDeviceEnumerator enumerator, OutputSlot slot, string deviceId)
+        {
+            bool active = IsDeviceActive(enumerator, deviceId);
+            if (slot.Live && (slot.Faulted || !active))
+            {
+                Log(slot.Name + " lost. Waiting for the device to return.");
+                StopOutput(slot);
+            }
+            if (!slot.Live && active && StartOutput(slot, deviceId))
+            {
+                Log(slot.Name + " reconnected.");
+            }
+        }
+
+        private static bool IsInputAvailable(MMDeviceEnumerator enumerator)
+        {
+            if (_selectedInputId != "default" && !string.IsNullOrEmpty(_selectedInputId))
+            {
+                return IsDeviceActive(enumerator, _selectedInputId);
+            }
+            try
+            {
+                return enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia).State == DeviceState.Active;
+            }
+            catch
+            {
+                return false; // no default render endpoint exists right now
+            }
+        }
+
+        private static bool IsDeviceActive(MMDeviceEnumerator enumerator, string deviceId)
+        {
+            try
+            {
+                return enumerator.GetDevice(deviceId).State == DeviceState.Active;
+            }
+            catch
+            {
+                return false; // the endpoint is not known to Windows right now
             }
         }
 
@@ -499,26 +644,16 @@ namespace AudioDuplicator
             _isRunning = false;
 
             try { if (_capture != null) _capture.StopRecording(); } catch { }
-            try { if (_play1 != null) _play1.Stop(); } catch { }
-            try { if (_play2 != null) _play2.Stop(); } catch { }
-
+            StopOutput(_out1);
+            StopOutput(_out2);
             try { if (_capture != null) _capture.Dispose(); } catch { }
-            try { if (_play1 != null) _play1.Dispose(); } catch { }
-            try { if (_play2 != null) _play2.Dispose(); } catch { }
-            try { if (_resampler1 != null) _resampler1.Dispose(); } catch { }
-            try { if (_resampler2 != null) _resampler2.Dispose(); } catch { }
 
             _capture = null;
-            _play1 = null;
-            _play2 = null;
-            _resampler1 = null;
-            _resampler2 = null;
-            _provider1 = null;
-            _provider2 = null;
-
-            _inputDevice = null;
-            _outDevice1 = null;
-            _outDevice2 = null;
+            _captureFaulted = false;
+            _out1.Provider = null;
+            _out2.Provider = null;
+            _out1.LastError = null;
+            _out2.LastError = null;
 
             Log("Duplication stopped.");
         }
@@ -570,6 +705,7 @@ namespace AudioDuplicator
         {
             lock (_audioLock)
             {
+                _wantRunning = false;
                 StopDuplicationInternal();
             }
 

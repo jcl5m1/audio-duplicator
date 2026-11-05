@@ -15,7 +15,7 @@ There is no project/solution file — compile directly with the .NET Framework C
 .\setup.ps1
 
 # Compile
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /r:NAudio.dll /target:exe /out:AudioDuplicator.exe AudioDuplicator.cs
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /r:NAudio.dll /target:winexe /out:AudioDuplicator.exe AudioDuplicator.cs
 
 # Run
 .\AudioDuplicator.exe
@@ -26,7 +26,7 @@ There are no tests, linters, or package manager — the only dependency is `NAud
 To iterate during development, the build/restart cycle is: stop the running process, recompile, relaunch, then read `debug.log`:
 ```powershell
 Stop-Process -Name AudioDuplicator -Force -ErrorAction SilentlyContinue
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /r:NAudio.dll /target:exe /out:AudioDuplicator.exe AudioDuplicator.cs
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /r:NAudio.dll /target:winexe /out:AudioDuplicator.exe AudioDuplicator.cs
 Remove-Item debug.log -ErrorAction SilentlyContinue; Start-Process .\AudioDuplicator.exe
 ```
 
@@ -35,13 +35,15 @@ Remove-Item debug.log -ErrorAction SilentlyContinue; Start-Process .\AudioDuplic
 Everything lives in one file: **`AudioDuplicator.cs`** (single `static class Program`). Three pieces run off `Main`:
 
 1. **System tray UI** (`SetupSystemTray`) — the only control surface. Uses the legacy WinForms `ContextMenu`/`MenuItem` API. The `Input Device` / `Output 1` / `Output 2` submenus are **rebuilt on every `Popup`** by `PopulateDeviceMenu` so they reflect currently-active render endpoints and the saved selection (radio-checked). Selecting a device → `OnDeviceSelected` updates the in-memory id, calls `SaveSettings`, and live-restarts the pipeline if running. If the tray icon can't be created (headless session), `Main` falls back to a blocking wait and logs to console.
-2. **Audio duplication core** (`StartDuplicationInternal` / `StopDuplicationInternal`). One `WasapiLoopbackCaptureEx` capture feeds **two** `BufferedWaveProvider`s, each driving its own `WasapiOut`.
+2. **Audio duplication core** (`StartDuplicationInternal` / `StopDuplicationInternal`). One `WasapiLoopbackCaptureEx` capture feeds **two** `OutputSlot`s, each with a `BufferedWaveProvider` driving its own `WasapiOut`.
 3. **Stats loop** (`StatsLoop`, 1s tick) writes a per-second `STATS` line to `debug.log`.
+4. **Reconnect loop** (`ReconnectLoop`, 2s tick) reopens lost devices while `_wantRunning` is true.
 
 Key behaviors to preserve when editing:
+- **Reconnect**: `_wantRunning` is the user's intent; `_isRunning` only says the capture is up. A lost output is closed and reopened alone (`StopOutput` / `StartOutput`), so the other output is not interrupted. A lost capture restarts the whole pipeline, because the capture owns the buffers. Do not use `WasapiOut.PlaybackState` to detect a lost device: it still says `Playing` after the play thread dies with an exception. Use the `Faulted` flag, set from `PlaybackStopped`.
 - **Resampling decision (`RequiresResampling`)**: a per-output `MediaFoundationResampler` is inserted **only** when `AudioClient.IsFormatSupported` says the device can't take the capture format directly. Do *not* revert to the naive `CompareFormats`-only gate: a 48k float capture and a 48k "Extensible" mix format are the same PCM data, and inserting an unnecessary same-rate resampler under-consumes the buffer and causes severe stutter (this was a real bug — see git history).
 - **Latency control**: capture buffer 40ms, outputs target 50ms. `PruneBuffer` clears a provider's buffer when its `BufferedDuration` exceeds 300ms — a safety valve for drift. With the resampler fix it should rarely if ever fire; if `prunes*` in `debug.log` climbs continuously, something upstream is wrong.
-- **Concurrency**: all audio start/stop/reconfig is guarded by `_audioLock`. Audio device fields (`_capture`, `_play1/2`, `_provider1/2`, etc.) are global mutable state — touch them only inside `_audioLock`. Diagnostic counters use `Interlocked`.
+- **Concurrency**: all audio start/stop/reconfig is guarded by `_audioLock`. Audio device fields (`_capture`, `_out1/2`, etc.) are global mutable state — touch them only inside `_audioLock`. Diagnostic counters use `Interlocked`.
 - **Custom loopback class**: `WasapiLoopbackCaptureEx` subclasses `WasapiCapture` to force `AudioClientStreamFlags.Loopback` while still allowing a custom buffer size (NAudio's stock `WasapiLoopbackCapture` doesn't expose this).
 
 ### Logging

@@ -16,7 +16,7 @@ See [`design.md`](design.md) for the full architecture and rationale.
 .\setup.ps1
 
 # 2. Compile
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /r:NAudio.dll /target:exe /out:AudioDuplicator.exe AudioDuplicator.cs
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /r:NAudio.dll /target:winexe /out:AudioDuplicator.exe AudioDuplicator.cs
 
 # 3. Run
 .\AudioDuplicator.exe
@@ -31,6 +31,8 @@ Right-click the tray icon to:
 - **Start / Stop Duplication** — toggle the pipeline (also available by double-clicking the tray icon).
 
 Selections are saved to `settings.json` and re-applied on the next launch; if both outputs are set, duplication auto-starts. Changing a device while running restarts the pipeline live.
+
+If a selected device disappears, the app reconnects to it automatically when it returns (checked every 2 seconds). The other output keeps playing while it waits. This includes a device that is missing when the app starts.
 
 ## Diagnostics
 
