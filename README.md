@@ -28,6 +28,7 @@ Right-click the tray icon to:
 
 - **Input Device** — pick the capture source (defaults to *System Default Render Loopback*; choose your virtual cable here).
 - **Output 1 / Output 2** — pick the two physical devices to play to. The current selection is shown next to each menu and check-marked in the submenu.
+- **Sine Tone and Equalizer** — set an independent sine tone and equalizer for each output. The tone slider is logarithmic from 10 Hz to 250 Hz, and the −/+ buttons change the tone by 1 Hz (hold a button to step 5 Hz each second). The 3-band equalizer has 3 points on a response plot: drag a point to set its frequency (10–250 Hz) and gain (−24 to +12 dB); double-click a point to reset it to 0 dB. The curve always passes through the 3 points, and the sound is cut above the highest point (above 250 Hz when the equalizer is off). The order is tone → equalizer. The tone mixes at 20% amplitude, and duplication must be running.
 - **Start / Stop Duplication** — toggle the pipeline (also available by double-clicking the tray icon).
 
 Selections are saved to `settings.json` and re-applied on the next launch; if both outputs are set, duplication auto-starts. Changing a device while running restarts the pipeline live.
